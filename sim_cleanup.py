@@ -1553,21 +1553,25 @@ class SimulatorTui:
         if not row:
             self._status("No simulator selected.", duration=3.0)
             return
-        default_targets = ",".join(DEFAULT_CLEAN_TARGETS)
-        reply = self._prompt(f"Targets to clean (Enter for {default_targets}):")
+        reply = self._prompt(
+            "Clean mode — [c]aches (safe), [d]ata (wipes user data), [b]oth:"
+        )
         if reply is None:
             self._status("Clean cancelled.", duration=2.0)
             return
-        targets = (
-            [token.strip() for token in reply.split(",") if token.strip()]
-            if reply
-            else list(DEFAULT_CLEAN_TARGETS)
-        )
-        unknown = set(targets) - set(CLEAN_TARGETS.keys())
-        if unknown:
-            self._status(f"Unknown targets: {', '.join(sorted(unknown))}", duration=5.0)
+        choice = reply.strip().lower()
+        if choice in ("", "c", "caches"):
+            mode_name, targets = "caches", list(CLEAN_CACHES_TARGETS)
+        elif choice in ("d", "data"):
+            mode_name, targets = "data", list(CLEAN_DATA_TARGETS)
+        elif choice in ("b", "both"):
+            mode_name, targets = "both", list(CLEAN_BOTH_TARGETS)
+        else:
+            self._status(f"Unknown mode: {reply!r}", duration=4.0)
             return
-        execute = self._prompt_yes_no("Apply changes (otherwise dry-run)?", default=False)
+        execute = self._prompt_yes_no(
+            f"Apply {mode_name} clean (otherwise dry-run)?", default=False
+        )
         if execute is None:
             self._status("Clean cancelled.", duration=2.0)
             return
@@ -1939,7 +1943,11 @@ def cmd_clean(args: argparse.Namespace) -> None:
     LOGGER.debug("cmd_clean discovered %d devices", len(devices))
     device = ensure_device(args.udid, devices)
 
-    targets = set(args.targets)
+    mode = getattr(args, "mode", None)
+    if mode:
+        targets = set(CLEAN_MODES[mode])
+    else:
+        targets = set(args.targets)
     unknown = targets - CLEAN_TARGETS.keys()
     if unknown:
         print(f"error: unknown targets {', '.join(sorted(unknown))}", file=sys.stderr)
@@ -2237,7 +2245,58 @@ def clean_target_bundles(device: DeviceInfo, dry_run: bool) -> Optional[int]:
     return clear_directory_contents(path, dry_run=dry_run)
 
 
-DEFAULT_CLEAN_TARGETS: Tuple[str, ...] = ("device-caches", "app-caches", "tmp")
+def clean_target_app_data(device: DeviceInfo, dry_run: bool) -> Optional[int]:
+    """Clear Documents, Application Support, and tmp for every app container.
+
+    Preserves Library/Preferences so NSUserDefaults (login tokens, onboarding
+    flags, etc.) survive the clean. This is more destructive than app-caches
+    because it wipes real user content stored by apps.
+    """
+    app_root = device.path / "data" / "Containers" / "Data" / "Application"
+    if not app_root.exists():
+        LOGGER.debug("No app containers at %s", app_root)
+        return None
+    total = 0
+    LOGGER.debug("Cleaning app data for %s (dry_run=%s)", device.udid, dry_run)
+    for entry in app_root.iterdir():
+        if not entry.is_dir():
+            continue
+        for rel in ("Documents", "Library/Application Support", "tmp"):
+            target = entry / rel
+            if not target.exists():
+                continue
+            LOGGER.debug("Cleaning app data dir %s", target)
+            total += clear_directory_contents(target, dry_run=dry_run)
+    LOGGER.debug("App data reclaimed %s bytes for %s", total, device.udid)
+    return total or None
+
+
+def clean_target_mobile_assets(device: DeviceInfo, dry_run: bool) -> Optional[int]:
+    """Clear downloaded iOS assets (Siri voices, dictation models, etc.).
+
+    iOS re-downloads these on demand, so the first boot after cleaning can
+    feel slower until the essentials are refetched.
+    """
+    path = device.path / "data" / "private" / "var" / "MobileAsset"
+    if not path.exists():
+        LOGGER.debug("No MobileAsset directory at %s", path)
+        return None
+    LOGGER.debug("Cleaning mobile assets for %s at %s (dry_run=%s)", device.udid, path, dry_run)
+    return clear_directory_contents(path, dry_run=dry_run)
+
+
+# Mode groupings used by the TUI and CLI --mode flag.
+CLEAN_CACHES_TARGETS: Tuple[str, ...] = ("device-caches", "app-caches", "tmp")
+CLEAN_DATA_TARGETS: Tuple[str, ...] = ("app-data", "mobile-assets")
+CLEAN_BOTH_TARGETS: Tuple[str, ...] = CLEAN_CACHES_TARGETS + CLEAN_DATA_TARGETS
+
+CLEAN_MODES: Dict[str, Tuple[str, ...]] = {
+    "caches": CLEAN_CACHES_TARGETS,
+    "data": CLEAN_DATA_TARGETS,
+    "both": CLEAN_BOTH_TARGETS,
+}
+
+DEFAULT_CLEAN_TARGETS: Tuple[str, ...] = CLEAN_CACHES_TARGETS
 
 
 CLEAN_TARGETS: Dict[str, Callable[[DeviceInfo, bool], Optional[int]]] = {
@@ -2249,6 +2308,8 @@ CLEAN_TARGETS: Dict[str, Callable[[DeviceInfo, bool], Optional[int]]] = {
     "logs": clean_target_logs,
     "shared": clean_target_shared,
     "bundles": clean_target_bundles,
+    "app-data": clean_target_app_data,
+    "mobile-assets": clean_target_mobile_assets,
 }
 
 
@@ -2287,6 +2348,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     clean = subparsers.add_parser("clean", help="Remove temporary data from a simulator.")
     clean.add_argument("udid", help="Simulator UDID.")
+    clean.add_argument(
+        "--mode",
+        choices=sorted(CLEAN_MODES.keys()),
+        help="Preset target group: caches (safe), data (wipes user data), both.",
+    )
     clean.add_argument(
         "--targets",
         nargs="+",

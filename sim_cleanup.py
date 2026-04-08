@@ -152,13 +152,15 @@ class DeviceRow:
     progress_bytes: Optional[int] = None
     log_bytes: Optional[int] = None
     error: Optional[str] = None
+    # Transient row-level message (e.g. "Cleaning caches…", "Reclaimed 1.7 GB").
+    # When set, it takes precedence over size_label() in the TUI.
+    row_message: Optional[str] = None
 
     def size_label(self) -> str:
+        if self.row_message:
+            return self.row_message
         if self.size_status == SizeStatus.DONE and self.size_bytes is not None:
-            label = format_size(self.size_bytes)
-            if self.log_bytes:
-                label = f"{label} (+{format_size(self.log_bytes)} logs)"
-            return label
+            return format_size(self.size_bytes)
         if self.size_status == SizeStatus.RUNNING:
             if self.progress_bytes:
                 return f"Sizing… ({format_size(self.progress_bytes)})"
@@ -191,6 +193,12 @@ class SizeErrorEvent:
 class StatusMessageEvent:
     message: str
     duration: Optional[float] = 4.0
+
+
+@dataclass
+class RowMessageEvent:
+    udid: str
+    message: Optional[str]  # None clears the transient row message
 
 
 @dataclass
@@ -994,6 +1002,10 @@ class SimulatorTui:
                     row.size_status = SizeStatus.ERROR
                     row.error = event.message
                     row.progress_bytes = None
+            elif isinstance(event, RowMessageEvent):
+                row = self.row_lookup.get(event.udid)
+                if row:
+                    row.row_message = event.message
             elif isinstance(event, StatusMessageEvent):
                 self._status(event.message, duration=event.duration)
             elif isinstance(event, DetailOutputEvent):
@@ -1017,7 +1029,11 @@ class SimulatorTui:
             return
 
         title = "iOS Simulator Cleanup"
-        self._safe_addstr(0, max(0, (width - len(title)) // 2), title, curses.A_BOLD)
+        count_suffix = f"  •  {len(self.rows)} simulator{'s' if len(self.rows) != 1 else ''}"
+        total_len = len(title) + len(count_suffix)
+        title_x = max(0, (width - total_len) // 2)
+        self._safe_addnstr(0, title_x, title, width - title_x, curses.A_BOLD)
+        self._safe_addnstr(0, title_x + len(title), count_suffix, width - title_x - len(title), curses.A_DIM)
 
         # Bottom reserves: divider + hint line 1 + hint line 2 + status = 4 rows
         list_top = 1
@@ -1027,7 +1043,7 @@ class SimulatorTui:
         self._ensure_selection_visible(data_rows)
 
         mark_width = 2
-        size_width = 18
+        size_width = 22
         runtime_width = 18
         state_width = 10
         last_boot_width = 18
@@ -1094,7 +1110,7 @@ class SimulatorTui:
         elif sel_summary:
             status_text = sel_summary
         else:
-            status_text = f"{len(self.rows)} simulators discovered."
+            status_text = ""
 
         self._draw_footer(height, width, status_text)
         self.stdscr.refresh()
@@ -1380,16 +1396,23 @@ class SimulatorTui:
 
     def _prompt(self, message: str) -> Optional[str]:
         height, width = self.stdscr.getmaxyx()
+        # Paint a highly visible prompt bar across the last 3 rows,
+        # overwriting the key-hints footer for the duration of the prompt.
+        bar_top = height - 3
         prompt_line = height - 2
-        prompt_text = f"{message.strip()} "
-        self._safe_addnstr(prompt_line, 2, " " * (width - 4), width - 4)
-        self._safe_addnstr(prompt_line, 2, prompt_text[: width - 4], width - 4)
+        bar_bottom = height - 1
+        prompt_text = f"  > {message.strip()} "
+        blank = " " * max(0, width - 1)
+        accent = curses.A_REVERSE | curses.A_BOLD
+        for y in (bar_top, prompt_line, bar_bottom):
+            self._safe_addnstr(y, 0, blank, width - 1, accent)
+        self._safe_addnstr(prompt_line, 0, prompt_text, width - 1, accent)
         curses.echo()
         try:
             curses.curs_set(1)
         except curses.error:
             pass
-        start_x = min(width - 3, 2 + len(prompt_text))
+        start_x = min(width - 3, len(prompt_text))
         self.stdscr.move(prompt_line, start_x)
         self.stdscr.clrtoeol()
         self.stdscr.refresh()
@@ -1575,18 +1598,71 @@ class SimulatorTui:
         if execute is None:
             self._status("Clean cancelled.", duration=2.0)
             return
-        args = argparse.Namespace(
-            udid=row.info.udid,
-            targets=targets,
-            execute=execute,
-            yes=True,
-        )
-        self._run_cli_command(
-            f"{'Cleaning' if execute else 'Dry-run cleaning'} {row.info.name}",
-            cmd_clean,
-            args,
-            refresh_size_udids=[row.info.udid],
-        )
+        self._run_clean_inline(row.info, mode_name, targets, execute)
+
+    def _run_clean_inline(
+        self,
+        device: DeviceInfo,
+        mode_name: str,
+        targets: Sequence[str],
+        execute: bool,
+    ) -> None:
+        """Run a clean on a background thread and surface progress in the row."""
+        udid = device.udid
+        target_list = list(targets)
+        dry_run = not execute
+        verb = "Cleaning" if execute else "Dry-run cleaning"
+        self.event_queue.put(RowMessageEvent(udid, f"{verb} {mode_name}…"))
+        self._needs_draw = True
+
+        def job() -> None:
+            total_reclaimed = 0
+            failures: List[str] = []
+            for target in target_list:
+                handler = CLEAN_TARGETS.get(target)
+                if handler is None:
+                    failures.append(f"{target}: unknown target")
+                    continue
+                self.event_queue.put(
+                    RowMessageEvent(udid, f"{verb} {mode_name}… ({target})")
+                )
+                try:
+                    reclaimed = handler(device, dry_run=dry_run)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.debug("Clean target %s failed: %s", target, exc, exc_info=True)
+                    failures.append(f"{target}: {exc}")
+                    continue
+                if reclaimed:
+                    total_reclaimed += reclaimed
+            if failures:
+                summary = (
+                    f"{verb.capitalize()} {device.name} failed: {failures[0]}"
+                    if len(failures) == 1
+                    else f"{verb.capitalize()} {device.name} had {len(failures)} failures"
+                )
+                self.event_queue.put(
+                    RowMessageEvent(udid, f"Error: {failures[0].split(':')[0]}")
+                )
+                self.event_queue.put(StatusMessageEvent(summary, duration=6.0))
+            else:
+                prefix = "Would reclaim" if dry_run else "Reclaimed"
+                reclaimed_label = format_size(total_reclaimed) if total_reclaimed else "0 B"
+                self.event_queue.put(
+                    RowMessageEvent(udid, f"{prefix} {reclaimed_label}")
+                )
+                self.event_queue.put(
+                    StatusMessageEvent(
+                        f"{verb} {device.name}: {prefix.lower()} {reclaimed_label}.",
+                        duration=5.0,
+                    )
+                )
+            # Leave the summary visible long enough to read, then clear and
+            # restart the size probe.
+            time.sleep(6.0)
+            self.event_queue.put(RowMessageEvent(udid, None))
+            self.event_queue.put(RestartSizeJobEvent(udid))
+
+        self._submit_task(job)
 
     def _delete_selected(self) -> None:
         row = self._selected_row()

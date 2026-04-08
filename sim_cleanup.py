@@ -814,6 +814,8 @@ class SimulatorTui:
         self.pending_tasks = 0
         self.pending_lock = threading.Lock()
         self.exit_requested = False
+        self.multi_select_mode = False
+        self.selected_udids: set[str] = set()
         self.colors_enabled = False
         self.size_color_small = 0
         self.size_color_medium = 0
@@ -886,6 +888,7 @@ class SimulatorTui:
 
         self.rows = [DeviceRow(info=device) for device in devices]
         self.row_lookup = {row.info.udid: row for row in self.rows}
+        self.selected_udids &= set(self.row_lookup.keys())
         self._apply_cached_sizes()
         self._sort_rows()
         self.activity_lines = []
@@ -1016,7 +1019,10 @@ class SimulatorTui:
         title = "iOS Simulator Cleanup"
         self._safe_addstr(0, max(0, (width - len(title)) // 2), title, curses.A_BOLD)
 
-        help_line = "↑/↓ navigate • Enter detail • b boot • o open • c clean • d delete • s sort • r refresh • q quit"
+        if self.multi_select_mode:
+            help_line = "MULTI-SELECT — Space mark • a mark outdated • X clear • Enter/d delete marked • Esc/q exit"
+        else:
+            help_line = "↑/↓ nav • Enter detail • m multi-select • b boot • c clean • d delete • s sort • r refresh • q quit"
         self._safe_addnstr(1, 2, help_line, width - 4, curses.A_DIM)
 
         list_top = 2
@@ -1025,13 +1031,18 @@ class SimulatorTui:
         self.page_size = data_rows
         self._ensure_selection_visible(data_rows)
 
+        mark_width = 2
         size_width = 18
         runtime_width = 18
         state_width = 10
         last_boot_width = 18
-        name_width = max(10, width - (size_width + runtime_width + state_width + last_boot_width + 10))
+        name_width = max(
+            10,
+            width - (mark_width + size_width + runtime_width + state_width + last_boot_width + 12),
+        )
 
         header = (
+            f"{'':<{mark_width}}  "
             f"{'Size':>{size_width}}  "
             f"{'Name':<{name_width}}  "
             f"{'Runtime':<{runtime_width}}  "
@@ -1044,6 +1055,8 @@ class SimulatorTui:
         for idx, row in enumerate(visible_rows):
             y = list_top + 1 + idx
             attr = curses.A_REVERSE if (self.scroll_offset + idx) == self.selected_index else curses.A_NORMAL
+            marked = row.info.udid in self.selected_udids
+            mark_cell = (" *" if marked else "  ").ljust(mark_width)
             size_cell = self._truncate(row.size_label(), size_width).rjust(size_width)
             name_cell = self._truncate(row.info.name, name_width).ljust(name_width)
             runtime_cell = self._truncate(row.info.runtime, runtime_width).ljust(runtime_width)
@@ -1053,11 +1066,17 @@ class SimulatorTui:
             size_attr = attr | self._size_attr(
                 row.size_bytes if row.size_status == SizeStatus.DONE else None
             )
-            self._safe_addnstr(y, 2, size_cell, width - 4, size_attr)
+            mark_attr = attr | (curses.A_BOLD if marked else 0)
+            if self.colors_enabled and marked:
+                mark_attr |= self.size_color_large
+            self._safe_addnstr(y, 2, mark_cell, width - 4, mark_attr)
+            size_x = 2 + mark_width + 2
+            self._safe_addnstr(y, size_x, size_cell, max(0, width - 4 - (mark_width + 2)), size_attr)
             rest = f"  {name_cell}  {runtime_cell}  {state_cell}  {last_boot_cell}"
-            remaining = max(0, width - 4 - size_width)
+            rest_x = size_x + size_width
+            remaining = max(0, width - 2 - rest_x)
             if remaining:
-                self._safe_addnstr(y, 2 + size_width, rest[:remaining], remaining, attr)
+                self._safe_addnstr(y, rest_x, rest[:remaining], remaining, attr)
 
         divider_y = list_top + data_rows + 1
         self._safe_addnstr(divider_y, 1, "─" * (width - 2), width - 2, curses.A_DIM)
@@ -1067,7 +1086,19 @@ class SimulatorTui:
         for idx, line in enumerate(self._detail_lines()[:available_detail]):
             self._safe_addnstr(detail_top + idx, 2, line[: width - 4], width - 4)
 
-        status_text = self.status_message or f"{len(self.rows)} simulators discovered."
+        if self.selected_udids:
+            sel_total = self._selected_total_bytes()
+            sel_summary = (
+                f"{len(self.selected_udids)} marked • {format_size(sel_total)} — press D to delete"
+            )
+        else:
+            sel_summary = ""
+        if self.status_message:
+            status_text = self.status_message
+        elif sel_summary:
+            status_text = sel_summary
+        else:
+            status_text = f"{len(self.rows)} simulators discovered."
         self._safe_addnstr(height - 2, 2, status_text[: width - 4], width - 4, curses.A_DIM)
         self._safe_addnstr(height - 1, 2, "Press '?' for help.", width - 4, curses.A_DIM)
         self.stdscr.refresh()
@@ -1113,6 +1144,9 @@ class SimulatorTui:
         if self.detail_overlay_visible:
             self._handle_detail_overlay_key(key)
             return
+        if self.multi_select_mode:
+            self._handle_multi_select_key(key)
+            return
         if key in (curses.KEY_UP, ord("k")):
             self._move_selection(-1)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -1133,10 +1167,17 @@ class SimulatorTui:
             self.activity_lines = [
                 "Hotkeys:",
                 "  Enter — show full detail report",
+                "  m — enter multi-select mode (batch delete)",
+                "      Space — toggle mark on current row",
+                "      a — mark all outdated iOS sims (older than latest iOS)",
+                "      X — clear marks",
+                "      Enter/d — confirm batch delete",
+                "      Esc/q — exit multi-select",
                 "  b — boot via simctl",
                 "  o — open simulator data in Finder",
                 "  c — clean caches/tmp",
-                "  d — delete simulator",
+                "  d — delete selected simulator",
+                "  s — toggle sort",
                 "  r — refresh inventory",
                 "  q — quit",
             ]
@@ -1147,6 +1188,8 @@ class SimulatorTui:
             self._open_selected_in_finder()
         elif key in (ord("c"), ord("C")):
             self._clean_selected()
+        elif key in (ord("m"), ord("M")):
+            self._enter_multi_select_mode()
         elif key in (ord("d"), ord("D")):
             self._delete_selected()
         elif key in (curses.KEY_ENTER, 10, 13):
@@ -1524,6 +1567,210 @@ class SimulatorTui:
             refresh_devices=True,
             retain_udid=retain_udid,
         )
+
+    def _enter_multi_select_mode(self) -> None:
+        if self.multi_select_mode:
+            return
+        self.multi_select_mode = True
+        self.selected_udids.clear()
+        self._status(
+            "Multi-select mode — Space mark, a mark outdated, Enter/d delete, Esc cancel.",
+            duration=None,
+        )
+
+    def _exit_multi_select_mode(self, message: str = "Multi-select cancelled.") -> None:
+        if not self.multi_select_mode:
+            return
+        self.multi_select_mode = False
+        self.selected_udids.clear()
+        self._status(message, duration=3.0)
+
+    def _handle_multi_select_key(self, key: int) -> None:
+        if key in (curses.KEY_UP, ord("k")):
+            self._move_selection(-1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self._move_selection(1)
+        elif key == curses.KEY_PPAGE:
+            self._move_selection(-self.page_size)
+        elif key == curses.KEY_NPAGE:
+            self._move_selection(self.page_size)
+        elif key == ord("g"):
+            self._set_selection(0)
+        elif key == ord("G"):
+            self._set_selection(len(self.rows) - 1)
+        elif key == ord(" "):
+            self._toggle_mark_current()
+        elif key == ord("a"):
+            self._mark_outdated()
+        elif key in (ord("X"), ord("c"), ord("C")):
+            self.selected_udids.clear()
+            self._status("Marks cleared.", duration=2.0)
+        elif key in (curses.KEY_ENTER, 10, 13, ord("d"), ord("D")):
+            self._batch_delete_marked()
+        elif key in (27, ord("q"), ord("Q")):
+            self._exit_multi_select_mode()
+        self._needs_draw = True
+
+    def _toggle_mark_current(self) -> None:
+        row = self._selected_row()
+        if not row:
+            return
+        udid = row.info.udid
+        if udid in self.selected_udids:
+            self.selected_udids.discard(udid)
+        else:
+            self.selected_udids.add(udid)
+        self._move_selection(1)
+
+    def _selected_total_bytes(self) -> int:
+        total = 0
+        for udid in self.selected_udids:
+            row = self.row_lookup.get(udid)
+            if row and row.size_bytes is not None:
+                total += row.size_bytes
+        return total
+
+    @staticmethod
+    def _ios_runtime_version(raw_runtime: str) -> Optional[Tuple[int, ...]]:
+        """Parse an ``iOS-<MAJOR>-<MINOR>`` runtime id into a version tuple.
+
+        Returns None for non-iOS runtimes so callers can ignore them.
+        """
+        if not raw_runtime:
+            return None
+        suffix = raw_runtime.rsplit(".", 1)[-1]
+        if not suffix.startswith("iOS-"):
+            return None
+        parts = suffix[len("iOS-"):].split("-")
+        try:
+            return tuple(int(p) for p in parts if p)
+        except ValueError:
+            return None
+
+    def _mark_outdated(self) -> None:
+        versions = [
+            self._ios_runtime_version(row.info.raw_runtime) for row in self.rows
+        ]
+        available = [v for v in versions if v is not None]
+        if not available:
+            self._status("No iOS runtimes detected.", duration=3.0)
+            return
+        latest = max(available)
+        added = 0
+        for row, version in zip(self.rows, versions):
+            if version is None or version >= latest:
+                continue
+            if row.info.udid not in self.selected_udids:
+                self.selected_udids.add(row.info.udid)
+                added += 1
+        latest_label = ".".join(str(p) for p in latest)
+        if added:
+            self._status(
+                f"Marked {added} simulator(s) older than iOS {latest_label}.",
+                duration=4.0,
+            )
+        else:
+            self._status(
+                f"No additional outdated simulators (latest iOS {latest_label}).",
+                duration=4.0,
+            )
+
+    def _batch_delete_marked(self) -> None:
+        if not self.selected_udids:
+            self._status("Nothing marked. Press Space to mark or Esc to exit.", duration=3.0)
+            return
+        targets: List[DeviceRow] = []
+        booted_skipped: List[str] = []
+        for udid in list(self.selected_udids):
+            row = self.row_lookup.get(udid)
+            if not row:
+                self.selected_udids.discard(udid)
+                continue
+            if row.info.state == "Booted":
+                booted_skipped.append(row.info.name)
+                continue
+            targets.append(row)
+        if not targets:
+            if booted_skipped:
+                self._status(
+                    f"All marked sims are Booted; skipping: {', '.join(booted_skipped)}",
+                    duration=6.0,
+                )
+            else:
+                self._status("Nothing to delete.", duration=3.0)
+            return
+
+        total_bytes = sum((r.size_bytes or 0) for r in targets)
+        warn = f" ({len(booted_skipped)} Booted skipped)" if booted_skipped else ""
+        confirm = self._prompt_yes_no(
+            f"Delete {len(targets)} simulators reclaiming ~{format_size(total_bytes)}?{warn}",
+            default=False,
+        )
+        if confirm is not True:
+            self._status("Batch delete cancelled.", duration=2.0)
+            return
+        execute = self._prompt_yes_no("Apply deletion (otherwise dry-run)?", default=False)
+        if execute is None:
+            self._status("Batch delete cancelled.", duration=2.0)
+            return
+
+        target_udids = [r.info.udid for r in targets]
+        target_names = {r.info.udid: r.info.name for r in targets}
+        retain_udid = self._udid_after_delete()
+        dry_run = not execute
+        description = (
+            f"{'Dry-run deleting' if dry_run else 'Deleting'} {len(target_udids)} simulators"
+        )
+
+        def job() -> None:
+            successes = 0
+            failures: List[str] = []
+            reclaimed = 0
+            for udid in target_udids:
+                name = target_names.get(udid, udid)
+                if dry_run:
+                    self.event_queue.put(
+                        StatusMessageEvent(f"(dry-run) would delete {name}", duration=2.0)
+                    )
+                    successes += 1
+                    continue
+                try:
+                    result = subprocess.run(
+                        ["xcrun", "simctl", "delete", udid],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                except (FileNotFoundError, subprocess.SubprocessError) as exc:
+                    failures.append(f"{name}: {exc}")
+                    continue
+                if result.returncode == 0:
+                    successes += 1
+                    row = self.row_lookup.get(udid)
+                    if row and row.size_bytes:
+                        reclaimed += row.size_bytes
+                else:
+                    err = (result.stderr or result.stdout or "unknown error").strip().splitlines()
+                    failures.append(f"{name}: {err[-1] if err else 'unknown error'}")
+            parts = [f"Deleted {successes}/{len(target_udids)}"]
+            if not dry_run and reclaimed:
+                parts.append(f"~{format_size(reclaimed)} reclaimed")
+            if failures:
+                parts.append(f"{len(failures)} failed")
+            if booted_skipped:
+                parts.append(f"{len(booted_skipped)} Booted skipped")
+            self.event_queue.put(StatusMessageEvent(" • ".join(parts), duration=8.0))
+            if failures:
+                self.event_queue.put(
+                    DetailOutputEvent(lines=["Batch delete failures:"] + failures)
+                )
+            self.event_queue.put(ReloadDevicesEvent(selected_udid=retain_udid))
+
+        # Optimistically clear marks; refreshed device list will repopulate if any remain.
+        self.selected_udids.difference_update(target_udids)
+        self.multi_select_mode = False
+        self._status(description, duration=None)
+        self._submit_task(job)
 
     def _udid_after_delete(self) -> Optional[str]:
         if len(self.rows) <= 1:

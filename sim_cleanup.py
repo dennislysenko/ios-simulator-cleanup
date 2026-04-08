@@ -1019,14 +1019,9 @@ class SimulatorTui:
         title = "iOS Simulator Cleanup"
         self._safe_addstr(0, max(0, (width - len(title)) // 2), title, curses.A_BOLD)
 
-        if self.multi_select_mode:
-            help_line = "MULTI-SELECT — Space mark • a mark outdated • X clear • Enter/d delete marked • Esc/q exit"
-        else:
-            help_line = "↑/↓ nav • Enter detail • m multi-select • b boot • c clean • d delete • s sort • r refresh • q quit"
-        self._safe_addnstr(1, 2, help_line, width - 4, curses.A_DIM)
-
-        list_top = 2
-        list_height = max(4, height - 7)
+        # Bottom reserves: divider + hint line 1 + hint line 2 + status = 4 rows
+        list_top = 1
+        list_height = max(4, height - 10)
         data_rows = max(1, list_height - 1)
         self.page_size = data_rows
         self._ensure_selection_visible(data_rows)
@@ -1082,14 +1077,15 @@ class SimulatorTui:
         self._safe_addnstr(divider_y, 1, "─" * (width - 2), width - 2, curses.A_DIM)
 
         detail_top = divider_y + 1
-        available_detail = max(1, height - detail_top - 2)
+        # Footer reserves 4 rows: divider + hint1 + hint2 + status.
+        available_detail = max(1, height - detail_top - 4)
         for idx, line in enumerate(self._detail_lines()[:available_detail]):
             self._safe_addnstr(detail_top + idx, 2, line[: width - 4], width - 4)
 
         if self.selected_udids:
             sel_total = self._selected_total_bytes()
             sel_summary = (
-                f"{len(self.selected_udids)} marked • {format_size(sel_total)} — press D to delete"
+                f"{len(self.selected_udids)} marked • {format_size(sel_total)} — press Enter/d to delete"
             )
         else:
             sel_summary = ""
@@ -1099,9 +1095,83 @@ class SimulatorTui:
             status_text = sel_summary
         else:
             status_text = f"{len(self.rows)} simulators discovered."
-        self._safe_addnstr(height - 2, 2, status_text[: width - 4], width - 4, curses.A_DIM)
-        self._safe_addnstr(height - 1, 2, "Press '?' for help.", width - 4, curses.A_DIM)
+
+        self._draw_footer(height, width, status_text)
         self.stdscr.refresh()
+
+    def _draw_footer(self, height: int, width: int, status_text: str) -> None:
+        """Render the two-line bracketed help footer plus a status line.
+
+        Layout (bottom-up): status line, hint line 2, hint line 1, divider.
+        """
+        if self.multi_select_mode:
+            line1 = [
+                ("↑↓", "navigate"),
+                ("Space", "mark"),
+                ("a", "mark outdated"),
+                ("X", "clear"),
+            ]
+            line2 = [
+                ("Enter/d", "delete marked"),
+                ("Esc/q", "exit multi-select"),
+            ]
+        else:
+            line1 = [
+                ("↑↓", "navigate"),
+                ("Enter", "detail"),
+                ("m", "multi-select"),
+                ("b", "boot"),
+                ("o", "open"),
+            ]
+            line2 = [
+                ("c", "clean"),
+                ("d", "delete"),
+                ("s", "sort"),
+                ("r", "refresh"),
+                ("q", "quit"),
+            ]
+
+        divider_y = height - 4
+        hint1_y = height - 3
+        hint2_y = height - 2
+        status_y = height - 1
+
+        self._safe_addnstr(divider_y, 1, "─" * (width - 2), width - 2, curses.A_DIM)
+        self._draw_key_hints(hint1_y, width, line1)
+        self._draw_key_hints(hint2_y, width, line2)
+        self._safe_addnstr(status_y, 2, status_text[: width - 4], width - 4, curses.A_BOLD)
+
+    def _draw_key_hints(
+        self, y: int, width: int, items: Sequence[Tuple[str, str]]
+    ) -> None:
+        x = 2
+        right_edge = width - 2
+        first = True
+        for key, label in items:
+            sep = "" if first else "   "
+            first = False
+            if x + len(sep) >= right_edge:
+                return
+            if sep:
+                self._safe_addnstr(y, x, sep, right_edge - x, curses.A_DIM)
+                x += len(sep)
+            bracket_left = "["
+            bracket_right = "]"
+            chunk = f"{bracket_left}{key}{bracket_right} {label}"
+            if x + len(chunk) > right_edge:
+                # Write what fits dimmed, then stop.
+                self._safe_addnstr(y, x, chunk, right_edge - x, curses.A_DIM)
+                return
+            self._safe_addnstr(y, x, bracket_left, right_edge - x, curses.A_DIM)
+            x += 1
+            self._safe_addnstr(y, x, key, right_edge - x, curses.A_BOLD)
+            x += len(key)
+            self._safe_addnstr(y, x, bracket_right, right_edge - x, curses.A_DIM)
+            x += 1
+            self._safe_addnstr(y, x, " ", right_edge - x)
+            x += 1
+            self._safe_addnstr(y, x, label, right_edge - x)
+            x += len(label)
 
     def _draw_detail_overlay(self, height: int, width: int) -> None:
         title = self.detail_overlay_title or "Simulator Detail"
@@ -1163,25 +1233,6 @@ class SimulatorTui:
             self.refresh_devices()
         elif key in (ord("s"), ord("S")):
             self._toggle_sort_mode()
-        elif key in (ord("?"),):
-            self.activity_lines = [
-                "Hotkeys:",
-                "  Enter — show full detail report",
-                "  m — enter multi-select mode (batch delete)",
-                "      Space — toggle mark on current row",
-                "      a — mark all outdated iOS sims (older than latest iOS)",
-                "      X — clear marks",
-                "      Enter/d — confirm batch delete",
-                "      Esc/q — exit multi-select",
-                "  b — boot via simctl",
-                "  o — open simulator data in Finder",
-                "  c — clean caches/tmp",
-                "  d — delete selected simulator",
-                "  s — toggle sort",
-                "  r — refresh inventory",
-                "  q — quit",
-            ]
-            self._status("Help displayed.", duration=5.0)
         elif key in (ord("b"), ord("B")):
             self._boot_selected()
         elif key in (ord("o"), ord("O")):

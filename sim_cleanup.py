@@ -814,12 +814,51 @@ class SimulatorTui:
         self.pending_tasks = 0
         self.pending_lock = threading.Lock()
         self.exit_requested = False
+        self.colors_enabled = False
+        self.size_color_small = 0
+        self.size_color_medium = 0
+        self.size_color_large = 0
+
+    # Size color thresholds (bytes). Below small = green, between = yellow,
+    # at or above large = red. Tuned for typical simulator sizes.
+    SIZE_THRESHOLD_SMALL = 500 * 1024 * 1024  # 500 MB
+    SIZE_THRESHOLD_LARGE = 2 * 1024 * 1024 * 1024  # 2 GB
+
+    def _init_colors(self) -> None:
+        if not curses.has_colors():
+            return
+        try:
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            curses.init_pair(1, curses.COLOR_GREEN, bg)
+            curses.init_pair(2, curses.COLOR_YELLOW, bg)
+            curses.init_pair(3, curses.COLOR_RED, bg)
+        except curses.error:
+            return
+        self.size_color_small = curses.color_pair(1)
+        self.size_color_medium = curses.color_pair(2)
+        self.size_color_large = curses.color_pair(3)
+        self.colors_enabled = True
+
+    def _size_attr(self, size_bytes: Optional[int]) -> int:
+        if not self.colors_enabled or size_bytes is None:
+            return 0
+        if size_bytes >= self.SIZE_THRESHOLD_LARGE:
+            return self.size_color_large
+        if size_bytes >= self.SIZE_THRESHOLD_SMALL:
+            return self.size_color_medium
+        return self.size_color_small
 
     def run(self) -> None:
         try:
             curses.curs_set(0)
         except curses.error:
             pass
+        self._init_colors()
         self.stdscr.timeout(self.poll_timeout_ms)
         self.refresh_devices(initial=True)
         while self.running:
@@ -1011,8 +1050,14 @@ class SimulatorTui:
             state_cell = self._truncate(row.info.state, state_width).ljust(state_width)
             last_boot = row.info.last_booted_at or "-"
             last_boot_cell = self._truncate(last_boot, last_boot_width).ljust(last_boot_width)
-            line = f"{size_cell}  {name_cell}  {runtime_cell}  {state_cell}  {last_boot_cell}"
-            self._safe_addnstr(y, 2, line[: width - 4], width - 4, attr)
+            size_attr = attr | self._size_attr(
+                row.size_bytes if row.size_status == SizeStatus.DONE else None
+            )
+            self._safe_addnstr(y, 2, size_cell, width - 4, size_attr)
+            rest = f"  {name_cell}  {runtime_cell}  {state_cell}  {last_boot_cell}"
+            remaining = max(0, width - 4 - size_width)
+            if remaining:
+                self._safe_addnstr(y, 2 + size_width, rest[:remaining], remaining, attr)
 
         divider_y = list_top + data_rows + 1
         self._safe_addnstr(divider_y, 1, "─" * (width - 2), width - 2, curses.A_DIM)
